@@ -60,23 +60,20 @@
 ### Data
 | Directory | Contents | Status |
 |-----------|----------|--------|
-| `datasets/images/real/` | 100 synthetic real images | ✅ Created |
-| `datasets/images/fake/` | 100 synthetic fake images | ✅ Created |
+| `datasets/images/real/` | 17,401 real images | ✅ Downloaded |
+| `datasets/images/fake/` | 28,366 fake images | ✅ Downloaded |
 
 ---
 
 ## 🔄 Current Training Progress
 
-### ViT Model Training (COMPLETED)
+### ViT Model Training (New Run)
 ```
-Epochs: 5
-Batch Size: 16
-Device: MPS (Apple Silicon GPU)
-Dataset: 200 images (100 real, 100 fake)
-Status: ✅ Detection model saved to vit_deepfake.pth
+Status: ⏳ Pending Start
+Dataset: ~45,000 Real/Fake Images
+Target: Retrain on real data
+Expected time: 2-3 hours
 ```
-
-Expected completion: ~5-10 minutes
 
 ---
 
