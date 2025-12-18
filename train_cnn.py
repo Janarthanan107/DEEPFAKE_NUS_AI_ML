@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-CNN + LSTM Training Script for Deepfake Detection
+CNN + LSTM Training Script for Video Deepfake Detection
 
-This script trains a CNN+LSTM model to detect deepfakes in videos.
-Best for: Videos with motion and temporal patterns
+This script trains a temporal model (ResNet + LSTM) on sequences of video frames.
+Best for: Detecting dynamic/temporal anomalies in videos.
 """
 
 import torch
@@ -13,327 +13,218 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
 from PIL import Image
 import os
-import cv2
+import glob
+from pathlib import Path
 from tqdm import tqdm
 import argparse
-from pathlib import Path
 import numpy as np
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
+from collections import defaultdict
+from sklearn.model_selection import train_test_split
 
-class VideoDeepfakeDataset(Dataset):
-    """Dataset for deepfake videos."""
+class VideoFrameDataset(Dataset):
+    """Dataset that groups frames into video sequences."""
     
-    def __init__(self, data_dir, transform=None, num_frames=16, split='train'):
-        """
-        Args:
-            data_dir: Directory with 'real' and 'fake' subdirectories
-            transform: Optional transform to apply
-            num_frames: Number of frames to sample per video
-            split: 'train' or 'val'
-        """
+    def __init__(self, data_dir, sequence_length=10, transform=None, split='train', val_split=0.2):
         self.data_dir = Path(data_dir)
+        self.seq_len = sequence_length
         self.transform = transform
-        self.num_frames = num_frames
-        self.samples = []
         
-        # Load real videos (label = 0)
-        real_dir = self.data_dir / 'real'
-        if real_dir.exists():
-            for vid_path in real_dir.glob('*.mp4') + real_dir.glob('*.avi'):
-                self.samples.append((str(vid_path), 0))
+        # Group frames by video ID
+        self.video_frames = defaultdict(list)
+        self.labels = {}
         
-        # Load fake videos (label = 1)
-        fake_dir = self.data_dir / 'fake'
-        if fake_dir.exists():
-            for vid_path in fake_dir.glob('*.mp4') + fake_dir.glob('*.avi'):
-                self.samples.append((str(vid_path), 1))
+        # Helper to process directory
+        def process_dir(name, label):
+            dir_path = self.data_dir / name
+            if not dir_path.exists():
+                return
+            
+            # Find all images
+            images = list(dir_path.glob('*.png')) + list(dir_path.glob('*.jpg'))
+            
+            for img in images:
+                # Assuming format: videoID_frameNum.png
+                filename = img.name
+                video_id = filename.rsplit('_', 1)[0]
+                self.video_frames[video_id].append(str(img))
+                self.labels[video_id] = label
         
-        print(f"Loaded {len(self.samples)} {split} video samples")
+        process_dir('real', 0)
+        process_dir('fake', 1)
         
+        # Sort frames for each video to ensure temporal order
+        for vid in self.video_frames:
+            self.video_frames[vid].sort()
+            
+        # Get all video IDs
+        all_videos = list(self.video_frames.keys())
+        train_vids, val_vids = train_test_split(all_videos, test_size=val_split, random_state=42)
+        
+        self.video_ids = train_vids if split == 'train' else val_vids
+        print(f"Loaded {len(self.video_ids)} {split} videos (Total frames: {sum(len(self.video_frames[v]) for v in self.video_ids)})")
+
     def __len__(self):
-        return len(self.samples)
-    
-    def sample_frames(self, video_path, num_frames):
-        """Sample frames uniformly from video."""
-        cap = cv2.VideoCapture(video_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        if total_frames < num_frames:
-            # If video has fewer frames, repeat frames
-            frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
-        else:
-            # Sample uniformly
-            frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
-        
-        frames = []
-        for idx in frame_indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = cap.read()
-            if ret:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame = Image.fromarray(frame)
-                if self.transform:
-                    frame = self.transform(frame)
-                frames.append(frame)
-        
-        cap.release()
-        
-        # If we didn't get enough frames, pad with the last frame
-        while len(frames) < num_frames:
-            frames.append(frames[-1] if frames else torch.zeros(3, 224, 224))
-        
-        return torch.stack(frames)
+        return len(self.video_ids)
     
     def __getitem__(self, idx):
-        video_path, label = self.samples[idx]
+        video_id = self.video_ids[idx]
+        frames = self.video_frames[video_id]
+        label = self.labels[video_id]
         
-        try:
-            frames = self.sample_frames(video_path, self.num_frames)
-            return frames, label
-        except Exception as e:
-            print(f"Error loading {video_path}: {e}")
-            # Return a random different sample
-            return self.__getitem__((idx + 1) % len(self))
+        # improved sampling: take evenly spaced frames
+        frame_indices = np.linspace(0, len(frames)-1, self.seq_len, dtype=int)
+        selected_frames = [frames[i] for i in frame_indices]
+        
+        images = []
+        for p in selected_frames:
+            try:
+                img = Image.open(p).convert('RGB')
+                if self.transform:
+                    img = self.transform(img)
+                images.append(img)
+            except:
+                # Handle corrupted images by duplicating previous or zero
+                if len(images) > 0:
+                    images.append(images[-1])
+                else:
+                    images.append(torch.zeros(3, 224, 224))
+        
+        # Stack into [Seq_Len, C, H, W]
+        images = torch.stack(images)
+        return images, label
 
-class CNNLSTMDeepfakeDetector(nn.Module):
-    """CNN + LSTM for video deepfake detection."""
-    
-    def __init__(self, num_classes=2, hidden_size=256, num_layers=2):
-        super().__init__()
+class ResNetLSTM(nn.Module):
+    def __init__(self, num_classes=2, hidden_dim=256, num_layers=2):
+        super(ResNetLSTM, self).__init__()
         
-        # CNN backbone (ResNet-18)
+        # CNN Encoder (ResNet18)
         resnet = models.resnet18(pretrained=True)
-        # Remove the final FC layer
-        self.cnn = nn.Sequential(*list(resnet.children())[:-1])
+        self.cnn = nn.Sequential(*list(resnet.children())[:-1]) # Remove fc layer
+        self.cnn_out_dim = resnet.fc.in_features
         
-        # LSTM for temporal modeling
+        # LSTM
         self.lstm = nn.LSTM(
-            input_size=512,  # ResNet-18 output
-            hidden_size=hidden_size,
+            input_size=self.cnn_out_dim,
+            hidden_size=hidden_dim,
             num_layers=num_layers,
-            batch_first=True,
-            dropout=0.5 if num_layers > 1 else 0
+            batch_first=True
         )
         
-        # Classification head
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size, 128),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(128, num_classes)
-        )
+        # Classifier
+        self.fc = nn.Linear(hidden_dim, num_classes)
         
     def forward(self, x):
-        # x shape: (batch, num_frames, channels, height, width)
-        batch_size, num_frames, c, h, w = x.size()
+        # x shape: [Batch, Seq, C, H, W]
+        batch_size, seq_len, c, h, w = x.size()
         
-        # Extract features from each frame
-        # Reshape to (batch * num_frames, channels, height, width)
-        x = x.view(batch_size * num_frames, c, h, w)
+        # Flatten for CNN: [Batch * Seq, C, H, W]
+        c_in = x.view(batch_size * seq_len, c, h, w)
         
-        # Pass through CNN
-        features = self.cnn(x)  # (batch * num_frames, 512, 1, 1)
-        features = features.view(batch_size, num_frames, -1)  # (batch, num_frames, 512)
+        # Extract features
+        features = self.cnn(c_in) # [Batch * Seq, 512, 1, 1]
+        features = features.view(batch_size, seq_len, -1) # [Batch, Seq, 512]
         
-        # Pass through LSTM
-        lstm_out, _ = self.lstm(features)  # (batch, num_frames, hidden_size)
+        # LSTM
+        lstm_out, _ = self.lstm(features) # [Batch, Seq, Hidden]
         
-        # Use the last output for classification
-        last_output = lstm_out[:, -1, :]  # (batch, hidden_size)
+        # Take last time step
+        last_out = lstm_out[:, -1, :]
         
         # Classify
-        output = self.fc(last_output)  # (batch, num_classes)
-        
-        return output
+        out = self.fc(last_out)
+        return out
 
-def get_transforms(img_size=224, augment=True):
-    """Get video frame transforms."""
-    
-    if augment:
-        transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+def train(args):
+    # Device config
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
     else:
-        transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-    
-    return transform
-
-def train_epoch(model, dataloader, criterion, optimizer, device):
-    """Train for one epoch."""
-    model.train()
-    total_loss = 0
-    all_preds = []
-    all_labels = []
-    
-    pbar = tqdm(dataloader, desc='Training')
-    for frames, labels in pbar:
-        frames, labels = frames.to(device), labels.to(device)
+        device = torch.device('cpu')
         
-        # Forward pass
-        optimizer.zero_grad()
-        outputs = model(frames)
-        loss = criterion(outputs, labels)
-        
-        # Backward pass
-        loss.backward()
-        optimizer.step()
-        
-        # Track metrics
-        total_loss += loss.item()
-        _, predicted = torch.max(outputs, 1)
-        all_preds.extend(predicted.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
-        
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+    print(f"Using device: {device}")
     
-    avg_loss = total_loss / len(dataloader)
-    accuracy = accuracy_score(all_labels, all_preds)
+    # Transforms
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
     
-    return avg_loss, accuracy
-
-def validate(model, dataloader, criterion, device):
-    """Validate the model."""
-    model.eval()
-    total_loss = 0
-    all_preds = []
-    all_labels = []
-    all_probs = []
-    
-    with torch.no_grad():
-        pbar = tqdm(dataloader, desc='Validation')
-        for frames, labels in pbar:
-            frames, labels = frames.to(device), labels.to(device)
-            
-            outputs = model(frames)
-            loss = criterion(outputs, labels)
-            
-            total_loss += loss.item()
-            probs = torch.softmax(outputs, dim=1)[:, 1]
-            _, predicted = torch.max(outputs, 1)
-            
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
-            
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-    
-    avg_loss = total_loss / len(dataloader)
-    accuracy = accuracy_score(all_labels, all_preds)
-    precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='binary')
-    auc = roc_auc_score(all_labels, all_probs)
-    
-    return avg_loss, accuracy, precision, recall, f1, auc
-
-def main():
-    parser = argparse.ArgumentParser(description='Train CNN+LSTM for Deepfake Detection')
-    parser.add_argument('--data_dir', type=str, default='datasets/videos', help='Data directory')
-    parser.add_argument('--num_frames', type=int, default=16, help='Number of frames per video')
-    parser.add_argument('--img_size', type=int, default=224, help='Frame size')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
-    parser.add_argument('--epochs', type=int, default=20, help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--hidden_size', type=int, default=256, help='LSTM hidden size')
-    parser.add_argument('--num_layers', type=int, default=2, help='Number of LSTM layers')
-    parser.add_argument('--output', type=str, default='cnn_lstm_deepfake.pth', help='Output model path')
-    parser.add_argument('--device', type=str, default='auto', help='Device: cuda, mps, cpu, or auto')
-    
-    args = parser.parse_args()
-    
-    # Set device
-    if args.device == 'auto':
-        if torch.cuda.is_available():
-            device = torch.device('cuda')
-        elif torch.backends.mps.is_available():
-            device = torch.device('mps')
-        else:
-            device = torch.device('cpu')
-    else:
-        device = torch.device(args.device)
-    
-    print(f"\n{'='*70}")
-    print(f"🚀 Training CNN+LSTM Deepfake Detector")
-    print(f"{'='*70}")
-    print(f"Device: {device}")
-    print(f"Frames per video: {args.num_frames}")
-    print(f"Frame size: {args.img_size}")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Epochs: {args.epochs}")
-    print(f"Learning rate: {args.lr}")
-    print(f"{'='*70}\n")
-    
-    # Create datasets
-    train_transform = get_transforms(args.img_size, augment=True)
-    val_transform = get_transforms(args.img_size, augment=False)
-    
-    train_dataset = VideoDeepfakeDataset(args.data_dir, transform=train_transform, 
-                                         num_frames=args.num_frames, split='train')
-    val_dataset = VideoDeepfakeDataset(args.data_dir, transform=val_transform, 
-                                       num_frames=args.num_frames, split='val')
+    # Data
+    print("Preparing data...")
+    train_dataset = VideoFrameDataset(args.data_dir, args.seq_len, transform=transform, split='train')
+    val_dataset = VideoFrameDataset(args.data_dir, args.seq_len, transform=transform, split='val')
     
     if len(train_dataset) == 0:
-        print("❌ No training data found!")
-        print(f"Expected structure: {args.data_dir}/real/ and {args.data_dir}/fake/")
+        print("❌ No data found! Check path.")
         return
-    
-    # Create dataloaders
+
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
     
-    # Create model
-    print("📦 Loading model...")
-    model = CNNLSTMDeepfakeDetector(num_classes=2, hidden_size=args.hidden_size, 
-                                    num_layers=args.num_layers)
-    model = model.to(device)
+    # Model
+    model = ResNetLSTM().to(device)
     
-    # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
     
-    # Training loop
-    best_auc = 0.0
-    print("\n🔧 Starting training...\n")
+    print(f"Starting training for {args.epochs} epochs...")
     
     for epoch in range(args.epochs):
-        print(f"Epoch {epoch+1}/{args.epochs}")
-        print("-" * 70)
+        model.train()
+        train_loss = 0
+        correct = 0
+        total = 0
         
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_acc, precision, recall, f1, auc = validate(model, val_loader, criterion, device)
-        scheduler.step()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        for images, labels in pbar:
+            images = images.to(device)
+            labels = labels.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            
+            pbar.set_postfix({'loss': train_loss/len(train_loader), 'acc': 100*correct/total})
+            
+        # Validation
+        model.eval()
+        val_correct = 0
+        val_total = 0
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images = images.to(device)
+                labels = labels.to(device)
+                outputs = model(images)
+                _, predicted = torch.max(outputs.data, 1)
+                val_total += labels.size(0)
+                val_correct += (predicted == labels).sum().item()
         
-        print(f"\nResults:")
-        print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
-        print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
-        print(f"  Precision: {precision:.4f} | Recall: {recall:.4f} | F1: {f1:.4f} | AUC: {auc:.4f}")
+        print(f"Validation Acc: {100*val_correct/val_total:.2f}%")
         
-        if auc > best_auc:
-            best_auc = auc
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'auc': auc,
-                'accuracy': val_acc,
-            }, args.output)
-            print(f"  ✅ Saved best model (AUC: {auc:.4f})")
+        # Save model
+        torch.save(model.state_dict(), args.output)
         
-        print()
-    
-    print(f"\n{'='*70}")
-    print(f"✅ Training Complete!")
-    print(f"{'='*70}")
-    print(f"Best AUC: {best_auc:.4f}")
-    print(f"Model saved to: {args.output}")
-    print()
+    print(f"✅ Training complete. Model saved to {args.output}")
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_dir', type=str, default='datasets/videos')
+    parser.add_argument('--seq_len', type=int, default=10)
+    parser.add_argument('--batch_size', type=int, default=8) # Smaller batch for video sequences (memory intensive)
+    parser.add_argument('--epochs', type=int, default=5)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--output', type=str, default='cnn_lstm_deepfake.pth')
+    
+    args = parser.parse_args()
+    train(args)

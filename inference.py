@@ -1,43 +1,72 @@
 #!/usr/bin/env python3
 """
-Complete Deepfake Detection System - Inference Script
-
-This script combines all three models:
-1. Gating Classifier - Decides which model to use
-2. ViT Model - Detects deepfakes in images
-3. CNN Model - Detects deepfakes in videos (optional)
-
-Usage:
-    python3 inference.py --input video.mp4
-    python3 inference.py --input image.jpg
+Deepfake Detection Inference Script
+Combines Gating Classifier, ViT (Image), and CNN-LSTM (Video) models.
 """
 
+import sys
+import os
 import torch
 import torch.nn as nn
-from torchvision import transforms
+from torchvision import transforms, models
 from PIL import Image
 import cv2
 import numpy as np
+import timm
+import joblib
 import argparse
-from pathlib import Path
-import os
+import warnings
 
-# Import our modules
-from feature_extraction import extract_video_features
-from gating_model import predict_with_confidence as predict_gating
-from rule_based import get_decision_explanation
-from train_vit import ViTDeepfakeDetector
+# Suppress warnings
+warnings.filterwarnings("ignore")
 
-class DeepfakeInference:
-    """Complete deepfake detection inference pipeline."""
-    
-    def __init__(self, 
-                 gating_model_path='gating_rf.joblib',
-                 vit_model_path='vit_deepfake.pth',
-                 cnn_model_path=None,
-                 device='auto'):
-        """Initialize all models."""
+# Import our modules (assuming they are in the same directory)
+try:
+    from feature_extraction import extract_video_features
+    from gating_model import predict_with_confidence
+except ImportError:
+    print("Error: Could not import helper modules. Run from project root.")
+    sys.exit(1)
+
+# -----------------------------------------------------------------------------
+# Model Definitions (must match training scripts)
+# -----------------------------------------------------------------------------
+
+class ViTDeepfakeDetector(nn.Module):
+    """Vision Transformer for deepfake detection."""
+    def __init__(self, model_name='vit_base_patch16_224', pretrained=False, num_classes=2):
+        super().__init__()
+        self.vit = timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes)
         
+    def forward(self, x):
+        return self.vit(x)
+
+class ResNetLSTM(nn.Module):
+    """CNN + LSTM for video deepfake detection."""
+    def __init__(self, num_classes=2, hidden_dim=256, num_layers=2):
+        super(ResNetLSTM, self).__init__()
+        resnet = models.resnet18(weights=None) # No weights needed for inference load
+        self.cnn = nn.Sequential(*list(resnet.children())[:-1])
+        self.cnn_out_dim = resnet.fc.in_features
+        self.lstm = nn.LSTM(input_size=self.cnn_out_dim, hidden_size=hidden_dim, num_layers=num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+        
+    def forward(self, x):
+        batch_size, seq_len, c, h, w = x.size()
+        c_in = x.view(batch_size * seq_len, c, h, w)
+        features = self.cnn(c_in)
+        features = features.view(batch_size, seq_len, -1)
+        lstm_out, _ = self.lstm(features)
+        last_out = lstm_out[:, -1, :]
+        out = self.fc(last_out)
+        return out
+
+# -----------------------------------------------------------------------------
+# Inference Logic
+# -----------------------------------------------------------------------------
+
+class DeepfakeDetector:
+    def __init__(self, device='auto'):
         # Set device
         if device == 'auto':
             if torch.cuda.is_available():
@@ -48,243 +77,199 @@ class DeepfakeInference:
                 self.device = torch.device('cpu')
         else:
             self.device = torch.device(device)
+            
+        print(f"🚀 Initializing Deepfake Detector on {self.device}...")
         
-        print(f"🔧 Initializing Deepfake Detection System")
-        print(f"Device: {self.device}")
+        # Paths
+        self.gating_path = "gating_rf.joblib"
+        self.vit_path = "vit_deepfake.pth"
+        self.cnn_path = "cnn_lstm_deepfake.pth"
         
-        # Load gating classifier
-        self.gating_model_path = gating_model_path
-        self.has_gating = os.path.exists(gating_model_path)
-        if self.has_gating:
-            print(f"✅ Loaded gating classifier: {gating_model_path}")
+        # Load Gating Model
+        if os.path.exists(self.gating_path):
+            self.gating_clf = joblib.load(self.gating_path)
+            print("✅ Loaded Gating Classifier")
         else:
-            print(f"⚠️  Gating classifier not found, using rule-based routing")
-        
-        # Load ViT model
-        self.has_vit = False
-        if vit_model_path and os.path.exists(vit_model_path):
+            print("❌ Gating model not found!")
+            sys.exit(1)
+            
+        # Load ViT Model
+        self.vit_model = None
+        if os.path.exists(self.vit_path):
             try:
-                self.vit_model = ViTDeepfakeDetector(model_name='vit_tiny_patch16_224', 
-                                                     pretrained=False, num_classes=2)
-                checkpoint = torch.load(vit_model_path, map_location=self.device,weights_only=True)
-                self.vit_model.load_state_dict(checkpoint['model_state_dict'])
-                self.vit_model = self.vit_model.to(self.device)
-                self.vit_model.eval()
-                self.has_vit = True
-                print(f"✅ Loaded ViT model: {vit_model_path}")
+                # Initialize architecture
+                self.vit_model = ViTDeepfakeDetector()
+                # Load weights (handle incomplete training or different save formats)
+                checkpoint = torch.load(self.vit_path, map_location=self.device)
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    self.vit_model.load_state_dict(checkpoint['model_state_dict'])
+                else:
+                    self.vit_model.load_state_dict(checkpoint)
+                
+                self.vit_model.to(self.device).eval()
+                print("✅ Loaded ViT Model")
             except Exception as e:
-                print(f"⚠️  Could not load ViT model: {e}")
+                print(f"⚠️ Failed to load ViT model: {e}")
         else:
-            print(f"⚠️  ViT model not found: {vit_model_path}")
-        
-        # Load CNN model (optional)
-        self.has_cnn = False
-        if cnn_model_path and os.path.exists(cnn_model_path):
-            print(f"✅ Loaded CNN model: {cnn_model_path}")
-            self.has_cnn = True
+            print("⚠️ ViT model file not found (training might be in progress)")
+
+        # Load CNN Model
+        self.cnn_model = None
+        if os.path.exists(self.cnn_path):
+            try:
+                self.cnn_model = ResNetLSTM()
+                self.cnn_model.load_state_dict(torch.load(self.cnn_path, map_location=self.device))
+                self.cnn_model.to(self.device).eval()
+                print("✅ Loaded CNN-LSTM Model")
+            except Exception as e:
+                print(f"⚠️ Failed to load CNN model: {e}")
         else:
-            print(f"ℹ️  CNN model not available (optional)")
-        
-        # Image transform for ViT
+            print("⚠️ CNN model file not found")
+            
+        # Transforms
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
-        
-        print()
-    
-    def predict_image(self, image_path):
-        """Predict if an image is a deepfake."""
-        if not self.has_vit:
-            return {"error": "ViT model not loaded"}
-        
-        try:
-            # Load and preprocess image
-            image = Image.open(image_path).convert('RGB')
-            image_tensor = self.transform(image).unsqueeze(0).to(self.device)
+
+    def predict_vit(self, video_path, num_frames=5):
+        """Run ViT on sampled frames from the video."""
+        if not self.vit_model:
+            return None, 0.0
             
-            # Predict
-            with torch.no_grad():
-                output = self.vit_model(image_tensor)
-                probs = torch.softmax(output, dim=1)[0]
-                
-            fake_prob = probs[1].item()
-            real_prob = probs[0].item()
-            
-            prediction = "FAKE" if fake_prob > 0.5 else "REAL"
-            confidence = max(fake_prob, real_prob)
-            
-            return {
-                "prediction": prediction,
-                "confidence": confidence,
-                "fake_probability": fake_prob,
-                "real_probability": real_prob,
-                "model_used": "ViT"
-            }
-        except Exception as e:
-            return {"error": str(e)}
-    
-    def predict_video(self, video_path):
-        """Predict if a video is a deepfake."""
-        
-        # Step 1: Extract features for gating
-        print("📊 Extracting video features...")
-        features = extract_video_features(video_path)
-        
-        if features is None:
-            return {"error": "Could not extract features from video"}
-        
-        # Step 2: Decide which model to use
-        if self.has_gating:
-            try:
-                decision, confidence = predict_gating(features, self.gating_model_path)
-                print(f"🎯 Gating decision: {decision}")
-                print(f"   Confidence: {', '.join([f'{k}: {v:.1%}' for k, v in confidence.items()])}")
-            except:
-                decision, explanation = get_decision_explanation(features)
-                print(f"🎯 Rule-based decision: {decision}")
-                print(f"   {explanation}")
-        else:
-            decision, explanation = get_decision_explanation(features)
-            print(f"🎯 Rule-based decision: {decision}")
-            print(f"   {explanation}")
-        
-        # Step 3: Use the appropriate model
-        if decision == "ViT" or decision == "ViT + CNN":
-            if self.has_vit:
-                print("\n🔍 Running ViT detection on video frames...")
-                return self._predict_video_with_vit(video_path)
-            else:
-                return {"error": "ViT model recommended but not loaded"}
-        
-        elif decision == "CNN":
-            if self.has_cnn:
-                print("\n🔍 Running CNN detection...")
-                return {"error": "CNN model not yet implemented"}
-            else:
-                # Fallback to ViT
-                if self.has_vit:
-                    print("\n🔍 CNN not available, using ViT instead...")
-                    return self._predict_video_with_vit(video_path)
-                else:
-                    return {"error": "No detection model available"}
-        
-        return {"error": "Unknown routing decision"}
-    
-    def _predict_video_with_vit(self, video_path, num_frames=10):
-        """Analyze video using ViT on sampled frames."""
-        
-        # Sample frames from video
         cap = cv2.VideoCapture(video_path)
+        frames = []
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        if total_frames == 0:
-            return {"error": "Could not read video"}
+        # Randomly sample frames
+        indices = np.linspace(0, total_frames-1, num_frames, dtype=int)
         
-        frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
-        
-        predictions = []
-        for idx in frame_indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        for i in range(total_frames):
             ret, frame = cap.read()
-            
-            if not ret:
-                continue
-            
-            # Convert to PIL Image
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            image = Image.fromarray(frame_rgb)
-            image_tensor = self.transform(image).unsqueeze(0).to(self.device)
-            
-            # Predict
-            with torch.no_grad():
-                output = self.vit_model(image_tensor)
-                probs = torch.softmax(output, dim=1)[0]
-                fake_prob = probs[1].item()
-                predictions.append(fake_prob)
-        
+            if not ret: break
+            if i in indices:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = Image.fromarray(frame)
+                frames.append(self.transform(frame))
+                if len(frames) >= num_frames: break
         cap.release()
         
-        # Average predictions
-        avg_fake_prob = np.mean(predictions)
-        avg_real_prob = 1 - avg_fake_prob
+        if not frames:
+            return None, 0.0
+            
+        # Batch inference
+        batch = torch.stack(frames).to(self.device)
+        with torch.no_grad():
+            outputs = self.vit_model(batch)
+            probs = torch.softmax(outputs, dim=1)[:, 1] # Probability of Fake
+            avg_prob = torch.mean(probs).item()
+            
+        label = "FAKE" if avg_prob > 0.5 else "REAL"
+        return label, avg_prob
+
+    def predict_cnn(self, video_path, seq_len=10):
+        """Run CNN-LSTM on a sequence of frames."""
+        if not self.cnn_model:
+            return None, 0.0
+            
+        cap = cv2.VideoCapture(video_path)
+        frames = []
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        prediction = "FAKE" if avg_fake_prob > 0.5 else "REAL"
-        confidence = max(avg_fake_prob, avg_real_prob)
+        # Sample sequence
+        indices = np.linspace(0, total_frames-1, seq_len, dtype=int)
         
-        return {
-            "prediction": prediction,
-            "confidence": confidence,
-            "fake_probability": avg_fake_prob,
-            "real_probability": avg_real_prob,
-            "model_used": "ViT (frame-based)",
-            "frames_analyzed": len(predictions)
+        for i in range(total_frames):
+            ret, frame = cap.read()
+            if not ret: break
+            if i in indices:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = Image.fromarray(frame)
+                frames.append(self.transform(frame))
+        cap.release()
+        
+        # Pad if not enough frames
+        while len(frames) < seq_len:
+            frames.append(torch.zeros(3, 224, 224))
+            
+        frames = frames[:seq_len]
+        
+        # Create batch [1, Seq, C, H, W]
+        batch = torch.stack(frames).unsqueeze(0).to(self.device)
+        
+        with torch.no_grad():
+            output = self.cnn_model(batch)
+            prob = torch.softmax(output, dim=1)[0, 1].item()
+            
+        label = "FAKE" if prob > 0.5 else "REAL"
+        return label, prob
+
+    def analyze_video(self, video_path):
+        """Full pipeline: Extract features -> Route -> Predict."""
+        print(f"\n🔍 Analyzing: {video_path}")
+        
+        # 1. Extract Features
+        features = extract_video_features(video_path)
+        if features is None:
+            return {"error": "Could not process video"}
+            
+        # 2. Gating Classifier
+        route_pred = self.gating_clf.predict([features])[0]
+        route_class = {0: "ViT", 1: "CNN", 2: "ViT + CNN"}.get(route_pred, "ViT + CNN")
+        
+        print(f"🛣️ Routing Decision: {route_class}")
+        
+        results = {
+            "routing": route_class,
+            "final_prediction": "UNKNOWN",
+            "confidence": 0.0,
+            "details": {}
         }
-    
-    def predict(self, input_path):
-        """Auto-detect input type and predict."""
-        path = Path(input_path)
         
-        if not path.exists():
-            return {"error": f"File not found: {input_path}"}
+        vit_score = None
+        cnn_score = None
         
-        # Check file type
-        ext = path.suffix.lower()
+        # 3. Execute Models based on Route
+        if "ViT" in route_class and self.vit_model:
+            label, score = self.predict_vit(video_path)
+            vit_score = score
+            results["details"]["ViT"] = {"label": label, "score": score}
+            print(f"  📸 ViT Prediction: {label} ({score:.4f})")
+            
+        if "CNN" in route_class and self.cnn_model:
+            label, score = self.predict_cnn(video_path)
+            cnn_score = score
+            results["details"]["CNN"] = {"label": label, "score": score}
+            print(f"  🎥 CNN Prediction: {label} ({score:.4f})")
+            
+        # 4. Ensemble Logic (Simple Average)
+        scores = []
+        if vit_score is not None: scores.append(vit_score)
+        if cnn_score is not None: scores.append(cnn_score)
         
-        if ext in ['.jpg', '.jpeg', '.png', '.bmp']:
-            print(f"\n📷 Image detected: {path.name}")
-            return self.predict_image(input_path)
-        elif ext in ['.mp4', '.avi', '.mov', '.mkv']:
-            print(f"\n🎥 Video detected: {path.name}")
-            return self.predict_video(input_path)
+        if scores:
+            avg_score = sum(scores) / len(scores)
+            results["confidence"] = avg_score
+            results["final_prediction"] = "FAKE" if avg_score > 0.5 else "REAL"
         else:
-            return {"error": f"Unsupported file type: {ext}"}
+            results["final_prediction"] = "ERROR"
+            results["error"] = "No models available for routing decision"
+            
+        print(f"✨ FINAL VERDICT: {results['final_prediction']} ({results['confidence']:.2%})\n")
+        return results
 
 def main():
     parser = argparse.ArgumentParser(description='Deepfake Detection Inference')
-    parser.add_argument('--input', type=str, required=True, help='Input image or video')
-    parser.add_argument('--gating_model', type=str, default='gating_rf.joblib', help='Gating model path')
-    parser.add_argument('--vit_model', type=str, default='vit_deepfake.pth', help='ViT model path')
-    parser.add_argument('--cnn_model', type=str, default=None, help='CNN model path (optional)')
-    parser.add_argument('--device', type=str, default='auto', help='Device: cuda, mps, cpu, or auto')
-    
+    parser.add_argument('--video', type=str, required=True, help='Path to video file')
     args = parser.parse_args()
     
-    print("=" * 70)
-    print("🔬 Deepfake Detection System - Inference")
-    print("=" * 70)
-    print()
-    
-    # Initialize system
-    detector = DeepfakeInference(
-        gating_model_path=args.gating_model,
-        vit_model_path=args.vit_model,
-        cnn_model_path=args.cnn_model,
-        device=args.device
-    )
-    
-    # Run prediction
-    result = detector.predict(args.input)
-    
-    # Display results
-    print("=" * 70)
-    print("📊 RESULTS")
-    print("=" * 70)
-    
-    if "error" in result:
-        print(f"❌ Error: {result['error']}")
-    else:
-        print(f"Prediction: {result['prediction']}")
-        print(f"Confidence: {result['confidence']:.1%}")
-        print(f"Fake Probability: {result['fake_probability']:.1%}")
-        print(f"Real Probability: {result['real_probability']:.1%}")
-        print(f"Model Used: {result['model_used']}")
-        if 'frames_analyzed' in result:
-            print(f"Frames Analyzed: {result['frames_analyzed']}")
-    
-    print("=" * 70)
-    print()
+    if not os.path.exists(args.video):
+        print("❌ Video file not found!")
+        return
+        
+    detector = DeepfakeDetector()
+    detector.analyze_video(args.video)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
