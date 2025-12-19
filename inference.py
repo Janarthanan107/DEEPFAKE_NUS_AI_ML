@@ -97,19 +97,41 @@ class DeepfakeDetector:
         self.vit_model = None
         if os.path.exists(self.vit_path):
             try:
-                # Initialize architecture
-                self.vit_model = ViTDeepfakeDetector()
-                # Load weights (handle incomplete training or different save formats)
+                # First try Default (Base)
+                print("  Trying to load ViT (Base)...")
+                try_model = ViTDeepfakeDetector(model_name='vit_base_patch16_224')
                 checkpoint = torch.load(self.vit_path, map_location=self.device)
-                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                    self.vit_model.load_state_dict(checkpoint['model_state_dict'])
-                else:
-                    self.vit_model.load_state_dict(checkpoint)
                 
+                # Check for state dict
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    state_dict = checkpoint['model_state_dict']
+                else:
+                    state_dict = checkpoint
+                    
+                try_model.load_state_dict(state_dict)
+                self.vit_model = try_model
                 self.vit_model.to(self.device).eval()
-                print("✅ Loaded ViT Model")
+                print("✅ Loaded ViT Model (Base)")
+                
+            except RuntimeError as e:
+                # If size mismatch, try Tiny
+                if "size mismatch" in str(e):
+                    print("⚠️ Size mismatch with Base model. Trying ViT-Tiny...")
+                    try:
+                        try_model = ViTDeepfakeDetector(model_name='vit_tiny_patch16_224')
+                        try_model.load_state_dict(state_dict)
+                        self.vit_model = try_model
+                        self.vit_model.to(self.device).eval()
+                        print("✅ Loaded ViT Model (Tiny)")
+                    except Exception as e2:
+                         print(f"❌ Failed to load ViT Model (Tiny) as well: {e2}")
+                         self.vit_model = None
+                else:
+                    print(f"⚠️ Failed to load ViT model: {e}")
+                    self.vit_model = None
             except Exception as e:
                 print(f"⚠️ Failed to load ViT model: {e}")
+                self.vit_model = None
         else:
             print("⚠️ ViT model file not found (training might be in progress)")
 
