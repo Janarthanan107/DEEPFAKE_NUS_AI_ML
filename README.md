@@ -1,7 +1,6 @@
 # Hybrid Deepfake Detection: A Gating-Based Ensemble Approach
 **Course**: AI/ML Mini Project  
 **Date**: December 2025  
-**Group Members**: [Member 1], [Member 2], [Member 3]
 
 ---
 
